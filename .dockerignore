@@ -1,0 +1,21 @@
+# 1. 🚨 CRITICAL SECURITY: Never copy API keys into the image!
+.env
+env.yaml
+
+# 2. LOCAL BLOAT: Ignore the Mac Virtual Environment 
+# (Docker builds its own clean Linux environment using requirements.txt)
+venv/
+
+# 3. CACHE: Ignore compiled Python cache files
+# (These are compiled for Mac and will confuse Linux)
+__pycache__/
+*.pyc
+
+# 4. ONE-TIME SCRIPTS: Ignore local database setup files
+# (The Cloud app talks to Supabase over the internet, it doesn't need these!)
+seed_knowledge.py
+hotel_policy.txt
+
+# 5. DEV TOOLS: Ignore pyenv versioning files and Mac hidden files
+.python-version
+.DS_Store

@@ -1,0 +1,19 @@
+# Web Server & Telephony
+fastapi==0.135.3
+uvicorn==0.44.0
+python-multipart==0.0.26
+twilio==9.10.4
+
+# Voice AI Framework & Services
+# The brackets tell pip to grab the exact SDKs we need natively!
+pipecat-ai[silero,google,elevenlabs,deepgram]==0.0.108
+google-genai==1.73.0
+
+# Database
+supabase==2.28.3
+
+# Utilities & Async
+aiohttp==3.13.3
+pydantic==2.12.5
+loguru==0.7.3
+python-dotenv==1.2.1
