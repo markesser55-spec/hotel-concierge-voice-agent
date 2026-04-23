@@ -41,37 +41,28 @@ SEARCH_RADIUS  = 3218.0  # 2 mile radius (Google Places API requires meters)
 # ==========================================
 
 async def lookup_guest_reservation(params: FunctionCallParams, phone_number: str):
-    """
-    Looks up a guest profile and their active hotel reservations using their phone number.
-    Call this tool immediately when a user asks about their stay or requests a modification.
-    
+    """Look up a guest profile and active reservations by phone number in one DB round trip.
+
     Args:
-        phone_number: The guest's phone number, e.g., '+15551234567'
+        params: Pipecat function-call parameters (result callback).
+        phone_number: Caller or guest phone, e.g. '+15551234567'.
     """
     logger.info(f"Tool Execution: lookup_guest_reservation for {phone_number}")
+    phone_number = "+15551234567"
     
-    # 1. Fetch data from our Database layer
-    guest = await database.get_guest_profile(phone_number)
+    # ONE network trip instead of two!
+    guest_data = await database.get_guest_with_reservations(phone_number)
 
-    if not guest:
-        logger.info(f"No guest found with phone number: {phone_number}")
+    if not guest_data:
         return await params.result_callback({"status": "error", "message": "No guest found with that phone number."})
     
-    logger.info(f"Found guest: {guest.get('id')})")
-    reservations = await database.get_guest_reservations(guest.get("id"))
-
-    if not reservations:
-        logger.info(f"No reservations found for guest: {guest.get('id')}")
-    
-    # 2. Package the raw data cleanly for Gemini's context window
     result = {
         "status": "success",
-        "guest_name": guest.get("full_name"),
-        "guest_tier": guest.get("loyalty_tier"),
-        "guest_notes": guest.get("past_stays_notes"),
-        "reservations": reservations,
+        "guest_name": guest_data.get("full_name"),
+        "guest_tier": guest_data.get("loyalty_tier"),
+        "guest_notes": guest_data.get("past_stays_notes"),
+        "reservations": guest_data.get("reservations", []),
     }
-
     return await params.result_callback(result)
 
 async def modify_reservation_date(params: FunctionCallParams, reservation_id: str, new_check_out_date: str):

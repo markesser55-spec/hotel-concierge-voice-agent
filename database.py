@@ -33,30 +33,16 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # RELATIONAL DATABASE (RESERVATIONS)
 # ==========================================
 
-async def get_guest_profile(phone_number: str) -> dict:
-    """
-    Looks up a guest by their phone number. 
-    """
+async def get_guest_with_reservations(phone_number: str) -> dict:
+    """Fetches the guest profile AND their active reservations in a SINGLE network trip."""
     def _query():
-        # SQL Equivalent: SELECT * FROM guests WHERE phone_number = 'phone_number' LIMIT 1;
-        response = supabase.table("guests").select("*").eq("phone_number", phone_number).execute()
+        # The syntax '*, reservations(*)' forces a SQL Join under the hood!
+        response = supabase.table("guests").select("*, reservations(*)").eq("phone_number", phone_number).execute()
         if response.data:
-            return response.data[0] # Return the first matching guest
-        return {} # Return an empty dictionary if no guest is found
+            return response.data[0]
+        return {}
 
-    logger.info(f"[Database]: Looking up guest profile for {phone_number}...")
-    return await asyncio.to_thread(_query)
-
-async def get_guest_reservations(guest_id: str) -> list:
-    """
-    Fetches all active reservations for a specific guest using their UUID.
-    """
-    def _query():
-        # SQL Equivalent: SELECT * FROM reservations WHERE guest_id = 'guest_id' AND status = 'active';
-        response = supabase.table("reservations").select("*").eq("guest_id", guest_id).execute()
-        return response.data if response.data else []
-
-    logger.info(f"[Database]: Looking up guest reservations for {guest_id}...")
+    logger.info(f"[Database]: Fetching unified guest & reservation data for {phone_number}...")
     return await asyncio.to_thread(_query)
 
 async def modify_reservation_date(reservation_id: str, new_date: str) -> dict:

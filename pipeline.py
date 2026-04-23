@@ -38,8 +38,8 @@ def build_pipeline(transport) -> PipelineTask:
     # 2. Setup VAD (Voice Activity Detection) - Tuned for Noisy Environments
     vad_analyzer = SileroVADAnalyzer(
         params=VADParams(
-            confidence=0.65,
-            min_volume=0.5,   # Noise Floor: Ignores quiet distant background music
+            confidence=0.70,
+            min_volume=0.05,   # Noise Floor: Ignores quiet distant background music
             start_secs=0.2,   # Standard timing
             stop_secs=0.2
         )
@@ -98,7 +98,7 @@ def build_pipeline(transport) -> PipelineTask:
             # First or second strike: Polite nudge via the LLM
             nudge_message = {
                 "role": "user",
-                "content": f"[SYSTEM EVENT]: The caller has been completely silent. This is reminder {idle_count} of 3. Very politely and briefly ask if they are still there."
+                "content": f"[SYSTEM EVENT]: The caller has been completely silent. This is reminder {idle_count} of 3. Very politely and briefly ask if they are still there in a relaxing tone of voice."
             }
 
             await aggregator.push_frame(LLMMessagesAppendFrame([nudge_message], run_llm=True))
