@@ -126,6 +126,8 @@ async def websocket_endpoint(websocket: WebSocket):
             audio_in_sample_rate=8000,   # Twilio's sample rate
             audio_out_sample_rate=8000,
             add_wav_header=False,
+            vad_enabled=False,      # 🛡️ THE FIX: Explicitly disable Pipecat's default transport VAD!
+            vad_analyzer=None,
             serializer=twilio_serializer,
         ),
     )

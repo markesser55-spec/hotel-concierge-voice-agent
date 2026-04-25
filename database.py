@@ -64,7 +64,7 @@ async def modify_reservation_date(reservation_id: str, new_date: str) -> dict:
 # VECTOR DATABASE (KNOWLEDGE BASE)
 # ==========================================
 
-async def search_knowledge_base(query_embedding: list[float], threshold: float = 0.5, count: int = 3) -> list[dict]:
+async def search_knowledge_base(query_embedding: list[float], threshold: float = 0.65, count: int = 3) -> list[dict]:
     """
     Performs a mathematical Cosine Similarity search in Supabase using the 
     'match_hotel_policies' RPC function and HNSW index.

@@ -1,6 +1,5 @@
 """Deepgram STT factory for the voice pipeline (telephony-oriented defaults)."""
 
-import asyncio
 import os
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.transcriptions.language import Language
@@ -29,9 +28,7 @@ class ResilientDeepgramSTTService(DeepgramSTTService):
         while True:
             try:
                 await super()._connection_handler()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
+            except Exception as _e:
                 # Connection dropped mid-finalize. Reset stale flags so the
                 # pipeline doesn't wait forever for a confirmation that will
                 # never arrive on the new connection.
@@ -48,7 +45,7 @@ def get_stt_service() -> ResilientDeepgramSTTService:
             model=os.getenv("DEEPGRAM_MODEL", "nova-2-phonecall"),  # 🚀 Upgraded for Cellular!
             language=Language.EN_US,
             punctuate=True,
-            interim_results=False,
+            interim_results=True,
             endpointing=False,
             vad_events=False,
         ),

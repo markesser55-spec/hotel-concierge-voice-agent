@@ -38,10 +38,10 @@ def build_pipeline(transport) -> PipelineTask:
     # 2. Setup VAD (Voice Activity Detection) - Tuned for Noisy Environments
     vad_analyzer = SileroVADAnalyzer(
         params=VADParams(
-            confidence=0.70,
-            min_volume=0.05,   # Noise Floor: Ignores quiet distant background music
-            start_secs=0.2,   # Standard timing
-            stop_secs=0.2
+            confidence=0.65,
+            min_volume=0.05,
+            start_secs=0.2,
+            stop_secs=0.5
         )
     )
 
