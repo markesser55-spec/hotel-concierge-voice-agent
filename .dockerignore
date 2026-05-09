@@ -1,6 +1,5 @@
 # 1. 🚨 CRITICAL SECURITY: Never copy API keys into the image!
 .env
-env.yaml
 service.yaml
 
 # 2. LOCAL BLOAT: Ignore the Mac Virtual Environment 
