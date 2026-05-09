@@ -27,7 +27,9 @@ from services.stt import get_stt_service
 from services.tts import get_tts_service
 from services.llm import get_llm_service
 
-def build_pipeline(transport) -> PipelineTask:
+
+
+def build_pipeline(transport, call_sid: str = None, ani: str = None) -> PipelineTask:
     """Assembles the Pipecat pipeline using the provided transport."""
 
     # 1. Fetch AI Services
@@ -46,7 +48,8 @@ def build_pipeline(transport) -> PipelineTask:
     )
 
     # 3. Setup Context, Prompts, and Tools
-    tools_schema = ToolsSchema(standard_tools=tools.hotel_concierge_tools)
+    dynamic_tools = tools.get_hotel_concierge_tools(ani)
+    tools_schema = ToolsSchema(standard_tools=dynamic_tools)
 
     context = LLMContext( 
         messages=[{"role": "system", "content": SYSTEM_PROMPT}],
@@ -54,7 +57,7 @@ def build_pipeline(transport) -> PipelineTask:
     )
 
     # Register the tools with Gemini
-    for tool_func in tools.hotel_concierge_tools:
+    for tool_func in dynamic_tools:
         llm.register_direct_function(tool_func)
 
     # 4. Turn-Taking Logic
@@ -116,11 +119,12 @@ def build_pipeline(transport) -> PipelineTask:
 
     # 🚀 ENABLE LATENCY METRICS AND TOKEN TRACKING
     return PipelineTask(
-        pipeline, 
+        pipeline,
+        enable_tracing=True,
         params=PipelineParams(
             allow_interruptions=True,
             enable_metrics=True,         # Enables latency tracking (TTFB, TTFT)
-            enable_usage_metrics=True    # Enables LLM token tracking
+            enable_usage_metrics=True,    # Enables LLM token tracking
         ),
         observers=[MetricsLogObserver()] # Automatically prints metrics to the terminal
     )

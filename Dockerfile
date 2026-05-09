@@ -1,30 +1,49 @@
-# 1. Use the official, lightweight Python 3.12 image
-FROM python:3.12-slim
+# ==========================================
+# STAGE 1: The Builder Room
+# ==========================================
+FROM python:3.12-slim AS builder
 
-# 2. Set environment variables to optimize Python for the Cloud
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    ENVIRONMENT=production
-
-# 3. Create a working directory inside the container
-WORKDIR /app
-
-# 4. Install system-level audio dependencies
-# ffmpeg is essential for handling streaming audio bytes in Linux!
+# 1. Install the heavy compilers needed for pipecat-ai
 RUN apt-get update && apt-get install -y \
-    ffmpeg \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# 5. Copy your strictly pruned requirements file
+# 2. Create a virtual environment
+RUN python -m venv /opt/venv
+
+# 3. Make sure we use the virtual environment for pip installs
+ENV PATH="/opt/venv/bin:$PATH"
+
+# 4. Install requirements into the virtual environment
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 6. Copy all your beautiful Python code into the container
+
+# ==========================================
+# STAGE 2: The Clean Room (Final Image)
+# ==========================================
+FROM python:3.12-slim
+
+# 1. Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    ENVIRONMENT=production \
+    PATH="/opt/venv/bin:$PATH" 
+    # ^ We add the venv to the path here too!
+
+WORKDIR /app
+
+# 2. Install ONLY runtime dependencies (ffmpeg)
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# 3. Copy the compiled packages from Stage 1
+COPY --from=builder /opt/venv /opt/venv
+
+# 4. Copy your application code
 COPY . .
 
-# 7. Expose the port (Cloud Run uses this for documentation purposes)
 EXPOSE 8000
 
-# 8. Start the server (Dynamically passing the Cloud Run PORT, fallback to 8000)
 CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port ${PORT:-8000} --timeout-graceful-shutdown 10"]

@@ -1,272 +1,199 @@
 """
-Gemini tool implementations (hotel concierge)
-============================================
-Defines async functions the LLM can call via automatic function calling: they
-validate inputs where needed, talk to `database.py`, and return JSON strings for
-the model. Also builds the `hotel_concierge_tools` schema for `llm.py`.
+Gemini Tool Implementations (Optimized Voice API Gateway)
+=========================================================
+Eliminates synchronous LLM chaining for reads. The Voice Agent connects directly to the 
+MCP microservice over ultra-fast localhost SSE using a persistent connection.
 """
 
 import json
-import os
-import aiohttp
+import contextlib
 from loguru import logger
-from dotenv import load_dotenv
-from pydantic import ValidationError
+from pydantic import BaseModel, Field
+from pipecat.services.llm_service import FunctionCallParams
+from mcp.client.sse import sse_client
+from mcp.client.session import ClientSession
 from google import genai
 from google.genai import types as genai_types
-from pipecat.services.llm_service import FunctionCallParams
-import database
-from models import ModifyCheckoutRequest
+import auth
+from prompts import TIER_3_SPECIALIST_PROMPT
 
-load_dotenv()
-
-# Initialize GenAI specifically for embedding queries inside tools
 genai_client = genai.Client()
 
-# Must precisely match the model used in seed_knowledge.py
-EMBEDDING_MODEL = "gemini-embedding-001"
-GOOGLE_PLACES_URL = "https://places.googleapis.com/v1/places:searchText"
-
 # ==========================================
-# HOTEL LOCATION CONSTANTS
+# CLAUDE'S PERSISTENT SESSION OPTIMIZATION
 # ==========================================
-HOTEL_NAME     = "The Grand Horizon Resort & Spa"
-HOTEL_ADDRESS  = "4360 E Camelback Rd, Phoenix, AZ 85018"
-HOTEL_LAT      = 33.5094
-HOTEL_LNG      = -111.9977
-SEARCH_RADIUS  = 3218.0  # 2 mile radius (Google Places API requires meters)
-    
-# ==========================================
-# RESERVATION TOOLS - Supabase DB
-# ==========================================
+_mcp_session: ClientSession | None = None
+_exit_stack: contextlib.AsyncExitStack | None = None
 
-async def lookup_guest_reservation(params: FunctionCallParams, phone_number: str):
-    """Look up a guest profile and active reservations by phone number in one DB round trip.
+async def get_mcp_session() -> ClientSession:
+    """Return a cached MCP session, initializing it on first call."""
+    global _mcp_session, _exit_stack
+    if _mcp_session is None:
+        logger.info("Initializing persistent MCP SSE Connection...")
+        _exit_stack = contextlib.AsyncExitStack()
+        try:
+            streams = await _exit_stack.enter_async_context(sse_client("http://127.0.0.1:8001/sse"))
+            _mcp_session = await _exit_stack.enter_async_context(ClientSession(streams[0], streams[1]))
+            await _mcp_session.initialize()
+            logger.info("Persistent MCP session established over localhost")
+        except Exception as e:
+            logger.error(f"Failed to initialize MCP session: {e}")
+            await _exit_stack.aclose()
+            _exit_stack = None
+            _mcp_session = None
+            raise
+    return _mcp_session
 
-    Args:
-        params: Pipecat function-call parameters (result callback).
-        phone_number: Caller or guest phone, e.g. '+15551234567'.
-    """
-    logger.info(f"Tool Execution: lookup_guest_reservation for {phone_number}")
-    phone_number = "+15551234567"
-    
-    # ONE network trip instead of two!
-    guest_data = await database.get_guest_with_reservations(phone_number)
-
-    if not guest_data:
-        return await params.result_callback({"status": "error", "message": "No guest found with that phone number."})
-    
-    result = {
-        "status": "success",
-        "guest_name": guest_data.get("full_name"),
-        "guest_tier": guest_data.get("loyalty_tier"),
-        "guest_notes": guest_data.get("past_stays_notes"),
-        "reservations": guest_data.get("reservations", []),
-    }
-    return await params.result_callback(result)
-
-async def modify_reservation_date(params: FunctionCallParams, reservation_id: str, new_check_out_date: str):
-    """
-    Modifies a guest's checkout date. 
-    Requires the reservation_id and the new_check_out_date in YYYY-MM-DD format.
-    
-    Args:
-        reservation_id: The unique reservation ID, e.g., 'CONF-9876'
-        new_check_out_date: The new checkout date strictly in YYYY-MM-DD format.
-    """
-    logger.info(f"Tool Execution: modify_checkout_date for {reservation_id} to {new_check_out_date}")
-
+async def call_mcp_tool(tool_name: str, arguments: dict) -> str:
+    """Invoke an MCP tool using the persistent session."""
+    global _mcp_session, _exit_stack
+    logger.info(f"🌐 [MCP Client] Forwarding request: '{tool_name}'...")
     try:
-        # 1. PYDANTIC SECURITY BOUNCER
-        # We pass Gemini's raw output into our strict model.
-        safe_request = ModifyCheckoutRequest(
-            reservation_id=reservation_id,
-            new_check_out_date=new_check_out_date,
-        )
+        session = await get_mcp_session()
+        result = await session.call_tool(tool_name, arguments=arguments)
+        return result.content[0].text
+    except Exception as e:
+        logger.error(f"[MCP Client Error] {e}")
+        # If the connection drops, aggressively reset the session so next call reconnects
+        if _exit_stack:
+            await _exit_stack.aclose()
+            _exit_stack = None
+            _mcp_session = None
+        return json.dumps({"error": str(e)})
 
-        validated_data = safe_request.model_dump(mode='json')
+class SpecialistDecision(BaseModel):
+    """JSON schema for Tier 3 specialist output: action, ids, dates, and spoken summary."""
 
-        # 2. IF APPROVED, EXECUTE DATABASE UPDATE
-        update_result = await database.modify_reservation_date(
-            validated_data["reservation_id"],
-            validated_data["new_check_out_date"],
-        )
+    action: str = Field(description="Must be 'lookup', 'modify', or 'error'")
+    reservation_id: str = Field(description="The specific reservation ID, if applicable. Otherwise empty.")
+    new_date: str = Field(description="The new checkout date strictly in YYYY-MM-DD, if applicable. Otherwise empty.")
+    spoken_summary: str = Field(description="A highly concise, 1-2 sentence summary for the Voice Agent to speak aloud.")
 
-        if update_result:
-            logger.info(f"Successfully updated checkout date to: {update_result.get('check_out_date')}")
-            return await params.result_callback({"status": "success", "message": "Checkout date updated successfully."})
-        else:
-            logger.error(f"Failed to update checkout date for {reservation_id}")
-            return await params.result_callback({"status": "error", "message": "Failed to update checkout date."})
-    except ValidationError as e:
-        # 3. SELF-HEALING AI
-        # If Gemini passes "next Tuesday" instead of "2026-05-18", Pydantic throws an error.
-        # We catch the error so the app doesn't crash, and return a helpful error message to Gemini so it can try again!
-        logger.warning(f"Tool Warning: AI passed invalid data. Sending error back to LLM... {str(e)}")
-        return await params.result_callback({"status": "error", "message": "Invalid date format. Please provide the date in YYYY-MM-DD format. Example: 2026-05-18"})
+def get_hotel_concierge_tools(ani: str):
+    """Return Pipecat tool callables for one caller, with shared PIN auth and MCP-backed reads/writes.
 
-# ==========================================
-# UTILITY TOOLS (Mock Function)
-# ==========================================
-
-async def escalate_to_human(params: FunctionCallParams, reason: str, urgency: str):
-    """
-    Escalates the conversation to a human front desk agent. 
-    Use this instantly if the user is angry, has a billing dispute, or requests something you cannot do.
-    
     Args:
-        reason: A short summary of why the user needs a human.
-        urgency: 'Low', 'Medium', or 'High'
+        ani: Caller phone number (used for SMS PIN and implicit guest lookup).
+
+    Returns:
+        List of async tools to register on the voice LLM for this session.
     """
-    logger.info(f"Escalation Triggered! Reason: {reason} | Urgency: {urgency}")
-    return await params.result_callback({"status": "success", "message": "Escalation ticket created. Tell the guest you are transferring them to the Front Desk Manager."})
+    is_authenticated = False
 
-
-# ==========================================
-# KNOWLEDGE BASE TOOL (RAG) - Supabase Vector DB
-# ==========================================
-
-async def search_hotel_policies(params: FunctionCallParams, question: str):
-    """
-    Searches the hotel policy manual to answer questions about amenities, 
-    pool hours, parking, pets, check-in times, and other hotel rules.
-    Use this anytime a guest asks a general question about the hotel.
-    
-    Args:
-        question: The specific question the guest is asking, e.g. "What time does the pool close?"
-    """
-    logger.info(f"Tool Execution: search_hotel_policies for '{question}'")
-
-    try:
-        # 1. Turn the user's question into Math
-        # MUST use RETRIEVAL_QUERY and force 768 dimensions to match the DB
-        response = await genai_client.aio.models.embed_content(
-            model=EMBEDDING_MODEL,
-            contents=question,
-            config=genai_types.EmbedContentConfig(
-                task_type="RETRIEVAL_QUERY",
-                output_dimensionality=768,
-            ),
-        )
-        query_embedding = response.embeddings[0].values
-
-        # 2. Search Postgres using Cosine Similarity (Calls our HNSW RPC)
-        results = await database.search_knowledge_base(query_embedding)
-
-        if not results:
-            await params.result_callback({
+    async def verify_auth_pin(params: FunctionCallParams, pin: str):
+        nonlocal is_authenticated
+        logger.info("Tool Execution: verify_auth_pin")
+        success = await auth.check_verification_pin(ani, pin)
+        if success:
+            is_authenticated = True
+            return await params.result_callback({
                 "status": "success", 
-                "message": "No relevant policies found. Tell the guest you don't know and offer to escalate to the Front Desk."
+                "message": "PIN verified successfully. You MUST call lookup_guest_reservation again now to fetch the data."
             })
-            return
-            
-        # 3. Format the matching policies nicely for Gemini to read
-        policies = [match["content"] for match in results]
+        else:
+            return await params.result_callback({"status": "error", "message": "Incorrect PIN. Ask the user to try again."})
+
+    async def lookup_guest_reservation(params: FunctionCallParams, reservation_id: str = ""):
+        nonlocal is_authenticated
+        logger.info(f"Tool Execution: lookup_guest_reservation. res_id='{reservation_id}'")
         
-        return await params.result_callback({
-            "status": "success",
-            "relevant_policies": policies
-        })
+        if not is_authenticated:
+            logger.info("Guest not authenticated. Triggering SMS PIN...")
+            sent = await auth.send_verification_pin(ani)
+            if sent:
+                return await params.result_callback({
+                    "status": "auth_required",
+                    "message": "A 6-digit PIN has been sent. Follow prompt instructions to ask the user for it."
+                })
+            return await params.result_callback({"status": "error", "message": "Failed to send SMS PIN. Escalate to human."})
 
-    except Exception as e:
-        logger.error(f"Tool Error - RAG Search: {e}")
-        return await params.result_callback({"status": "error", "message": str(e)})
+        # DIRECT READ: Fast MCP call returned directly to Tier 1 stream
+        if reservation_id:
+            data_str = await call_mcp_tool("db_get_reservation", {"reservation_id": reservation_id})
+        else:
+            data_str = await call_mcp_tool("db_get_guest", {"phone_number": ani})
+            
+        guest_data = json.loads(data_str)
+        if not guest_data or "error" in guest_data:
+            return await params.result_callback({"status": "error", "message": "No guest found. Ask if they have a reservation ID."})
 
+        return await params.result_callback({"status": "success", "data": guest_data})
 
-# ==========================================
-# EXTERNAL LIVE API TOOLS (GOOGLE MAPS)
-# ==========================================
+    async def route_to_reservation_specialist(params: FunctionCallParams, guest_request: str, reservation_id: str = ""):
+        nonlocal is_authenticated
+        
+        if not is_authenticated:
+            return await params.result_callback({"status": "error", "message": "User is not authenticated. Call lookup_guest_reservation first."})
 
-async def search_nearby_places(params: FunctionCallParams, query: str):
-    """
-    Searches Google Maps for nearby restaurants, stores, pharmacies, or attractions.
-    Use this when a guest asks for recommendations outside of the hotel property.
-    
-    Args:
-        query: What the guest is looking for (e.g., "Italian restaurant", "closest pharmacy").
-    """
+        logger.info("[Tier 3 Specialist] Waking up Gemini 2.5 Flash for secure mutation...")
+        if reservation_id:
+            data_str = await call_mcp_tool("db_get_reservation", {"reservation_id": reservation_id})
+        else:
+            data_str = await call_mcp_tool("db_get_guest", {"phone_number": ani})
+            
+        guest_data = json.loads(data_str)
+        tier_3_prompt = TIER_3_SPECIALIST_PROMPT.format(guest_data=json.dumps(guest_data), guest_request=guest_request)
+        
+        try:
+            # TIER 3 DATABASE MUTATION: We use temperature=0.0 for deterministic writes
+            response = await genai_client.aio.models.generate_content(
+                model="gemini-2.5-flash", 
+                contents=tier_3_prompt,
+                config=genai_types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=SpecialistDecision,
+                    temperature=0.0 
+                )
+            )
+            decision = SpecialistDecision.model_validate_json(response.text)
 
-    logger.info(f"Live API Execution: Google Maps searching for '{query}'")
+            if decision.action == "modify" and decision.reservation_id and decision.new_date:
+                logger.info(f"⚡ Executing MCP Database Write: {decision.reservation_id} -> {decision.new_date}")
+                update_str = await call_mcp_tool("db_modify_reservation", {
+                    "reservation_id": decision.reservation_id,
+                    "new_date": decision.new_date
+                })
+                update_result = json.loads(update_str)
+                if not update_result or "error" in update_result:
+                     return await params.result_callback({"status": "error", "message": "The backend database failed to update."})
 
-    api_key = os.getenv("GOOGLE_MAPS_API_KEY")
-    if not api_key:
-        return await params.result_callback({"status": "error", "message": "Google Maps API key is missing."})
+            return await params.result_callback({"status": "success", "message": f"Specialist completed the task. DO NOT read the database. Speak this exact summary: '{decision.spoken_summary}'"})
 
-    # ENTERPRISE TRICK 1: FieldMasks
-    # Google Maps returns massive amounts of JSON (photos, geometry boundaries).
-    # We strictly limit the payload to exactly 4 fields, slashing latency and saving LLM context!
-    headers = {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": api_key,
-        "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.rating,places.regularOpeningHours.openNow",
-    }
-    
-    # ENTERPRISE TRICK 2: Context Anchoring
-    # If the user just says "Find pizza", Google won't know where to look. 
-    # We automatically inject our dummy hotel's location into the hidden search!
-    payload = {
-    "textQuery": query,
-    "languageCode": "en",
-    "pageSize": 3,  # Only fetch 3 from Google in the first place
-    "locationBias": {
-        "circle": {
-            "center": {
-                "latitude": HOTEL_LAT,
-                "longitude": HOTEL_LNG
-            },
-            "radius": SEARCH_RADIUS
-            }
-        }
-    }
+        except Exception as e:
+            logger.error(f"[Tier 3 Specialist] Error: {e}")
+            return await params.result_callback({"status": "error", "message": "Failed to modify reservation. Escalate."})
 
-    try:
-        # Make a non-blocking asynchronous network request
-        async with aiohttp.ClientSession() as session:
-            async with session.post(GOOGLE_PLACES_URL, headers=headers, json=payload) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    logger.error(f"Google Maps API Error: {response.status}: {error_text}")
-                    await params.result_callback({"status": "error", "message": "Failed to contact Google Maps."})
-                    return
+    async def search_hotel_policies(params: FunctionCallParams, question: str):
+        # DIRECT READ: Sent straight back to Tier 1 stream
+        logger.info(f"Tool Execution: search_hotel_policies for '{question}'")
+        data_str = await call_mcp_tool("search_hotel_policies", {"question": question})
+        policies = json.loads(data_str)
+        if isinstance(policies, dict) and "error" in policies:
+            return await params.result_callback({"status": "error", "message": policies["error"]})
+        if not policies:
+            return await params.result_callback({"status": "success", "message": "No relevant policies found. Offer to escalate."})
+        return await params.result_callback({"status": "success", "relevant_policies": policies})
 
-                data = await response.json()
-                places_data = data.get("places", [])
+    async def search_nearby_places(params: FunctionCallParams, query: str):
+        # DIRECT READ: Sent straight back to Tier 1 stream
+        logger.info(f"Tool Execution: search_nearby_places for '{query}'")
+        data_str = await call_mcp_tool("search_nearby_places", {"query": query})
+        places = json.loads(data_str)
+        if isinstance(places, dict) and "error" in places:
+            return await params.result_callback({"status": "error", "message": places["error"]})
+        if not places:
+            return await params.result_callback({"status": "success", "message": "No places found matching that description nearby."})
+        return await params.result_callback({"status": "success", "places": places})
 
-                if not places_data:
-                    await params.result_callback({"status": "success", "message": "No places found matching that description nearby."})
-                    return
-                
-                # Format the top 3 results
-                formatted_results = []
-                for place in places_data[:3]:
-                    name = place.get("displayName", {}).get("text", "Unknown Place")
-                    rating = place.get("rating", "No rating")
-                    address = place.get("formattedAddress", "Unknown Address")
+    async def escalate_to_human(params: FunctionCallParams, reason: str, urgency: str):
+        logger.info(f"Escalation Triggered! Reason: {reason} | Urgency: {urgency}")
+        return await params.result_callback({"status": "success", "message": "Ticket created. Tell guest you are transferring them."})
 
-                    is_open = place.get("regularOpeningHours", {}).get("openNow")
-                    status_str = "Currently Open" if is_open is True else ("Currently Closed" if is_open is False else "Hours Unknown")
-
-                    formatted_results.append({
-                        "name": name,
-                        "rating": f"{rating} stars" if rating != "No rating" else rating,
-                        "address": address,
-                        "status": status_str
-                    })
-
-                logger.info("[Google Maps] Results returning to agent:")
-                logger.info(json.dumps(formatted_results, indent=2))
-
-                return await params.result_callback(formatted_results)
-
-    except Exception as e:
-        logger.error(f"Tool Error - Google Maps API: {e}")
-        return await params.result_callback({"status": "error", "message": str(e)})
-
-# We export a list of our tools so we can easily hand the "Menu" to Gemini in Block 3.
-hotel_concierge_tools = [
-    lookup_guest_reservation,
-    modify_reservation_date,
-    escalate_to_human,
-    search_hotel_policies,
-    search_nearby_places,
-]
+    return [
+        verify_auth_pin,
+        lookup_guest_reservation,
+        route_to_reservation_specialist,
+        search_hotel_policies,
+        search_nearby_places,
+        escalate_to_human
+    ]
