@@ -60,6 +60,18 @@ async def modify_reservation_date(reservation_id: str, new_date: str) -> dict:
     logger.info(f"[Database]: Updating reservation {reservation_id} with new date {new_date}...")
     return await asyncio.to_thread(_update)
 
+async def get_reservation_by_id(reservation_id: str) -> dict:
+    """Fetches a specific reservation by ID if the phone number lookup fails."""
+    def _query():
+        # The syntax '*, guests(*)' forces a SQL Join to get the parent guest profile!
+        response = supabase.table("reservations").select("*, guests(*)").eq("id", reservation_id).execute()
+        if response.data:
+            return response.data[0]
+        return {}
+
+    logger.info(f"[Database]: Fetching reservation by ID: {reservation_id}...")
+    return await asyncio.to_thread(_query)
+
 # ==========================================
 # VECTOR DATABASE (KNOWLEDGE BASE)
 # ==========================================
