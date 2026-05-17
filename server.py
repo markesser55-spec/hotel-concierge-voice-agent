@@ -9,6 +9,7 @@ import base64
 import logging
 import re
 import uvicorn
+import httpx
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.context import Context
@@ -218,7 +219,7 @@ async def websocket_endpoint(websocket: WebSocket):
     with logger.contextualize(call_sid=call_sid, ani=ani, dnis=dnis):
         logger.info(f"Session Officially Established!  Called Number: {dnis}")
         
-        task = build_pipeline(transport, call_sid=call_sid, ani=ani)
+        task, call_context = build_pipeline(transport, call_sid=call_sid, ani=ani)
         runner = PipelineRunner(handle_sigint=False)
 
         @transport.event_handler("on_client_connected")
@@ -246,6 +247,84 @@ async def websocket_endpoint(websocket: WebSocket):
         ):
             # The entire phone call happens inside this execution block!
             await runner.run(task)
+
+            # ==============================================================================
+            # 🚀 POST-CALL AGENTIC SWARM TRIGGER
+            # ==============================================================================
+            try:
+                # 1. Dynamically parse the actual Pipecat Context Memory from RAM
+                transcript_lines = []
+                messages = call_context.get_messages() if hasattr(call_context, "get_messages") else call_context.messages
+                
+                for msg in messages:
+                    # Safely handle Pipecat message objects or dicts
+                    msg_dict = msg if isinstance(msg, dict) else (msg.model_dump() if hasattr(msg, "model_dump") else vars(msg))
+                    
+                    role = str(msg_dict.get("role", "")).upper()
+                    if role in ["SYSTEM", ""]:
+                        continue # Skip the invisible system prompt
+                        
+                    speaker = "BOT" if role in ["ASSISTANT", "MODEL"] else "USER"
+                    
+                    # --- A. EXTRACT TEXT (Handles Universal AND Gemini formats) ---
+                    content = msg_dict.get("content", "")
+                    if not content and "parts" in msg_dict:
+                        content_parts = [p["text"] for p in msg_dict["parts"] if "text" in p]
+                        content = " ".join(content_parts)
+                            
+                    if isinstance(content, str) and content.strip():
+                        if "[SYSTEM EVENT]" not in content: # Hide internal nudges
+                            transcript_lines.append(f"{speaker}: {content.strip()}")
+                            
+                    # --- B. EXTRACT TOOL CALLS (Required for QA rubric) ---
+                    if "tool_calls" in msg_dict and msg_dict["tool_calls"]:
+                        for tc in msg_dict["tool_calls"]:
+                            f_name = tc.get("function", {}).get("name", "unknown")
+                            transcript_lines.append(f"BOT [ACTION]: Called tool '{f_name}'")
+                    elif "parts" in msg_dict:
+                        for part in msg_dict.get("parts", []):
+                            if "function_call" in part:
+                                f_name = part["function_call"].get("name", "unknown")
+                                transcript_lines.append(f"BOT [ACTION]: Called tool '{f_name}'")
+
+                    # --- C. EXTRACT TOOL RESPONSES ---
+                    if role in ["TOOL", "FUNCTION"]:
+                        name = msg_dict.get("name", "unknown")
+                        transcript_lines.append(f"SYSTEM [DATA]: Tool '{name}' returned data.")
+                    elif "parts" in msg_dict:
+                        for part in msg_dict.get("parts", []):
+                            if "function_response" in part:
+                                name = part["function_response"].get("name", "unknown")
+                                transcript_lines.append(f"SYSTEM [DATA]: Tool '{name}' returned data.")
+
+                real_transcript = "\n".join(transcript_lines)
+                
+                # Fallback if the user hangs up immediately
+                if not real_transcript.strip():
+                    real_transcript = "USER: [Hung up immediately. No transcript generated.]"
+                
+                logger.info(f"✅ Live transcript extracted from RAM ({len(real_transcript)} chars).")
+                
+                # 2. Fire the webhook to the cloud!
+                webhook_url = os.getenv("POST_CALL_WEBHOOK_URL", "http://localhost:8002/webhook/process-call")
+                
+                payload = {
+                    "call_sid": call_sid,
+                    "guest_phone": ani,
+                    "transcript": real_transcript
+                }
+                
+                async with httpx.AsyncClient() as client:
+                    logger.info(f"Firing webhook to {webhook_url}...")
+                    response = await client.post(webhook_url, json=payload, timeout=30.0)
+                    logger.info(f"✅ Webhook delivered. Backend returned: {response.status_code}")
+                        
+            except httpx.ConnectError:
+                logger.warning("⚠️ Webhook Failed: Backend is offline. Gracefully continuing shutdown.")
+            except httpx.TimeoutException:
+                logger.warning("⏳ Webhook timed out (30s). Voice Agent shutting down gracefully!")
+            except Exception as e:
+                logger.error(f"❌ Webhook extraction failure: {e}")
 
         try:
             provider = trace.get_tracer_provider()
