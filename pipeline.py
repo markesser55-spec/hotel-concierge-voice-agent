@@ -40,7 +40,7 @@ def build_pipeline(transport, call_sid: str = None, ani: str = None) -> Pipeline
     # 2. Setup VAD (Voice Activity Detection) - Tuned for Noisy Environments
     vad_analyzer = SileroVADAnalyzer(
         params=VADParams(
-            confidence=0.65,
+            confidence=0.70,
             min_volume=0.05,
             start_secs=0.2,
             stop_secs=0.5
@@ -101,8 +101,10 @@ def build_pipeline(transport, call_sid: str = None, ani: str = None) -> Pipeline
             # First or second strike: Polite nudge via the LLM
             nudge_message = {
                 "role": "user",
-                "content": f"[SYSTEM EVENT]: The caller has been completely silent. This is reminder {idle_count} of 3. Very politely and briefly ask if they are still there in a relaxing tone of voice."
+                "content": f"[SYSTEM EVENT]: The conversation paused. This could be because the user was silent, or because background noise accidentally interrupted you. This is reminder {idle_count} of 3. Very politely and briefly ask 'I'm sorry, did you say something?' or 'Are you still there?'"
             }
+
+            await aggregator.push_frame(LLMMessagesAppendFrame([nudge_message], run_llm=True))
 
             await aggregator.push_frame(LLMMessagesAppendFrame([nudge_message], run_llm=True))
 
@@ -118,7 +120,7 @@ def build_pipeline(transport, call_sid: str = None, ani: str = None) -> Pipeline
     ])
 
     # 🚀 ENABLE LATENCY METRICS AND TOKEN TRACKING
-    return PipelineTask(
+    task = PipelineTask(
         pipeline,
         enable_tracing=True,
         params=PipelineParams(
@@ -128,3 +130,5 @@ def build_pipeline(transport, call_sid: str = None, ani: str = None) -> Pipeline
         ),
         observers=[MetricsLogObserver()] # Automatically prints metrics to the terminal
     )
+
+    return task, context

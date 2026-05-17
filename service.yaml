@@ -28,6 +28,8 @@ spec:
           env:
             - name: SUPABASE_URL
               value: "https://evabhvbuvauttgvzplpf.supabase.co"
+            - name: POST_CALL_WEBHOOK_URL
+              value: "https://hotel-postcall-agents-314181581663.us-west4.run.app/webhook/process-call"
             - name: TWILIO_ACCOUNT_SID
               value: "ACc5dea6006945f47d713186606fb64412"
             - name: ELEVENLABS_VOICE_ID

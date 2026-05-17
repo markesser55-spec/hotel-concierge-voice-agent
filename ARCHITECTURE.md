@@ -1,6 +1,6 @@
 # Architecture — Enterprise Voice Hotel Concierge
 
-This document explains how **telephony** (`server.py`), **Pipecat pipeline** (`pipeline.py`), **voice-tier tools** (`tools.py`), and the **MCP data plane** (`mcp_server.py` + `database.py`) fit together; how **Twilio WebSockets** move audio; how **VAD** and **interruptions** work; how **Twilio Verify** gates sensitive reads and mutation routing; and how **OpenTelemetry / Langfuse** and **PII scrubbing** behave.
+This document explains how **telephony** (`server.py`), **Pipecat pipeline** (`pipeline.py`), **voice-tier tools** (`tools.py`), and the **MCP data plane** (`mcp_server.py` + `database.py`) fit together; how **Twilio WebSockets** move audio; how **VAD** and **interruptions** work; how **Twilio Verify** gates sensitive reads and mutation routing; how **OpenTelemetry / Langfuse** and **PII scrubbing** behave; and how **post-call LangGraph** workflows are triggered over HTTP after each session ends.
 
 ---
 
@@ -28,7 +28,11 @@ flowchart LR
   end
 
   subgraph tools[tools.py - MCP client]
-    TC[call_mcp_tool\nSSE client]
+    TC[persistent SSE session\ncall_mcp_tool]
+  end
+
+  subgraph postcall[Post-call LangGraph service\nexternal]
+    LG[Multi-agent workflows\nenrichment / sentiment / routing / outreach]
   end
 
   subgraph mcp[MCP server - mcp_server.py :8001]
@@ -56,29 +60,31 @@ flowchart LR
   MT --> MAPS
   MT --> EMB
   LLM -->|"verify_auth_pin / PIN flow"| TV
+  P -->|"after runner.run:\ntranscript + metadata"| LG
 ```
 
 **Separation of concerns**
 
 | Module | Responsibility |
 |--------|----------------|
-| `server.py` | Twilio HTTP + WebSocket I/O, TwiML, Media Streams **start** handshake, **`FastAPIWebsocketTransport`** (8 kHz, **transport VAD disabled**), **`PipelineRunner`**, root **OpenTelemetry** span per call, Langfuse exporter + **PII scrubbing**, Loguru patcher, greeting / disconnect frames, **tracer `force_flush`** after the call. |
-| `pipeline.py` | Pipeline graph, **Silero VAD** in the **LLM user aggregator**, **dynamic tool list** from **`get_hotel_concierge_tools(ani)`**, **`LLMContext`**, **`enable_tracing=True`**, metrics observers, idle / **EndFrame** safeguard. |
-| `tools.py` | **Tier-1 Gemini tools**: Twilio Verify–gated **`lookup_guest_reservation`**, MCP-backed reads (**`db_get_*`**, **`search_hotel_policies`**, **`search_nearby_places`**), **`route_to_reservation_specialist`** (secondary Gemini JSON decision + MCP **`db_modify_reservation`**), **`escalate_to_human`**. |
-| `mcp_server.py` | **FastMCP** process: SSE on **8001**; owns **Supabase** and **Places** traffic; embeddings for RAG. |
+| `server.py` | Twilio HTTP + WebSocket I/O, TwiML, Media Streams **start** handshake, **`FastAPIWebsocketTransport`** (8 kHz, **transport VAD disabled**), **`PipelineRunner`**, root **OpenTelemetry** span per call, Langfuse exporter + **PII scrubbing**, Loguru patcher, greeting / disconnect frames, **post-call webhook** to LangGraph (`POST_CALL_WEBHOOK_URL`), **tracer `force_flush`** after the call. |
+| `pipeline.py` | Pipeline graph, **Silero VAD** in the **LLM user aggregator**, **dynamic tool list** from **`get_hotel_concierge_tools(ani)`**, **`LLMContext`**, **`enable_tracing=True`**, metrics observers, idle / **EndFrame** safeguard; returns **`(PipelineTask, LLMContext)`** so `server.py` can export the live transcript. |
+| `tools.py` | **Tier-1 Gemini tools**: Twilio Verify–gated **`lookup_guest_reservation`**, MCP-backed reads (**`db_get_*`**, **`search_hotel_policies`**, **`search_nearby_places`**), **`route_to_reservation_specialist`** (secondary Gemini JSON decision + MCP **`db_modify_reservation`**), **`escalate_to_human`**. **Persistent MCP SSE/HTTP client** (`get_mcp_session` / `call_mcp_tool`)—not stdio. |
+| `mcp_server.py` | **FastMCP** process: **SSE over HTTP** on **8001** (`mcp.run(transport="sse")`); owns **Supabase** and **Places** traffic; embeddings for RAG. |
 | `database.py` | Supabase client and async-safe helpers (**`asyncio.to_thread`**); imported by **MCP only** for DB/RPC paths. |
 | `auth.py` | **Twilio Verify** send/check; used from **`tools.py`** (not from MCP). |
 
 Supporting: `services/*.py`, `prompts.py`, **`judge/qa_judge.py`** (offline QA from logs).
 
-### 1.1 Local development (two processes)
+### 1.1 Local development (two required processes + optional post-call)
 
 There is **no** local Docker requirement for the voice stack. Developers run:
 
-1. **`python mcp_server.py`** — FastMCP **SSE** on **`127.0.0.1:8001`** (loads **`database.py`**, Places, embeddings).
+1. **`python mcp_server.py`** — FastMCP **SSE over HTTP** on **`127.0.0.1:8001`** (`mcp.run(transport="sse")`); loads **`database.py`**, Places, embeddings. This is **not** MCP stdio transport.
 2. **`python server.py`** (or **`uvicorn server:app`**) — FastAPI + Pipecat, typically port **8000**.
+3. **(Optional)** LangGraph post-call microservice — listens on **`POST_CALL_WEBHOOK_URL`** (default **`http://localhost:8002/webhook/process-call`**). If offline, the voice server logs a warning and continues shutdown.
 
-**`tools.call_mcp_tool`** uses **`http://127.0.0.1:8001/sse`**, so both processes must share loopback (same host).
+**`tools.get_mcp_session()`** opens a **persistent** SSE connection to **`http://127.0.0.1:8001/sse`** and reuses it across tool calls (reconnects on failure). Voice and MCP must share loopback on the same host.
 
 ### 1.2 Google Cloud Run (multi-container)
 
@@ -118,7 +124,7 @@ If MCP is ever moved to a **separate** Cloud Run **Service**, update the SSE URL
 - **`logger.contextualize(call_sid=..., ani=..., dnis=...)`** + **`loguru_pii_scrubber`**: redacts **ANI** and **+1XXXXXXXXXX** patterns in log messages while preserving **DNIS** where coded.
 - **`on_client_connected`**: **`TTSSpeakFrame(GREETING_PROMPT)`**.
 - **`on_client_disconnected`**: **`EndFrame()`**.
-- **`build_pipeline(transport, call_sid=call_sid, ani=ani)`**: **`ani`** selects the closure for **`get_hotel_concierge_tools`**; **`call_sid`** is available for future wiring (currently unused inside `pipeline.py`).
+- **`task, call_context = build_pipeline(transport, call_sid=call_sid, ani=ani)`**: **`ani`** selects the closure for **`get_hotel_concierge_tools`**; **`call_context`** is the live **`LLMContext`** used after the call for transcript export.
 
 ### 2.5 Tracing (Langfuse)
 
@@ -126,6 +132,22 @@ If MCP is ever moved to a **separate** Cloud Run **Service**, update the SSE URL
 - **`tracer.start_as_current_span("twilio_voice_session", ...)`** with **`Context()`**, attributes **`session.id`**, **`call_sid`**, **`ani`**, **`dnis`** (span attributes scrubbed on export).
 - **`PipelineTask(enable_tracing=True)`** activates Pipecat span integration for processors.
 - After **`runner.run(task)`**, **`tracer_provider.force_flush()`** so batches reach Langfuse before the worker tears down.
+
+### 2.6 Post-call LangGraph webhook
+
+When **`runner.run(task)`** completes inside the **`twilio_voice_session`** span, **`server.py`**:
+
+1. Reads messages from **`call_context`** (`get_messages()` or **`.messages`**).
+2. Builds a plain-text transcript: **USER** / **BOT** lines, **BOT [ACTION]** tool calls, **SYSTEM [DATA]** tool results; skips system prompts and internal **`[SYSTEM EVENT]`** nudges.
+3. **`POST`s** JSON to **`POST_CALL_WEBHOOK_URL`** (default **`http://localhost:8002/webhook/process-call`**) via **`httpx`**:
+
+   ```json
+   { "call_sid": "...", "guest_phone": "<ani>", "transcript": "..." }
+   ```
+
+The **LangGraph microservice** (not in this repo) runs stateful **multi-agent** workflows: guest profile enrichment, sentiment analysis, operational task routing, and automated outreach.
+
+**Failure behavior:** **`httpx.ConnectError`** and **`httpx.TimeoutException`** log warnings; other exceptions log errors. The voice gateway always continues shutdown—post-call processing is best-effort and decoupled from the realtime path.
 
 ---
 
@@ -164,6 +186,10 @@ Three **silence strikes** → spoken goodbye + **`EndFrame`**; earlier strikes *
 
 **`MetricsLogObserver`** + **`enable_metrics`** / **`enable_usage_metrics`** for latency and usage signals.
 
+### 3.8 Return value for transcript export
+
+**`build_pipeline`** returns **`(task, context)`** where **`context`** is the **`LLMContext`** instance wired into the aggregators. **`server.py`** keeps a reference for post-call transcript extraction; the pipeline module does not perform the webhook itself.
+
 ---
 
 ## 4. Twilio WebSocket audio
@@ -182,11 +208,14 @@ Integrated from **`tools.verify_auth_pin`** and **`lookup_guest_reservation`** (
 
 ---
 
-## 6. `tools.py` — Voice-tier tools and MCP RPC
+## 6. `tools.py` — Voice-tier tools and MCP over SSE/HTTP
 
-Voice tools **do not** import **`database.py`**. Persistent and external APIs are reached via **`call_mcp_tool`**:
+Voice tools **do not** import **`database.py`**. The MCP boundary uses **SSE over HTTP**, **not** MCP stdio:
 
-- SSE URL: **`http://127.0.0.1:8001/sse`** (deployment must expose MCP on that host/port or replace this constant).
+- **`get_mcp_session()`** — lazy-initializes a module-level **`ClientSession`** via **`sse_client("http://127.0.0.1:8001/sse")`** and **`AsyncExitStack`**; logs **"Persistent MCP session established"** on first connect.
+- **`call_mcp_tool(tool_name, arguments)`** — reuses that session; on error, closes the stack and clears globals so the next call reconnects.
+
+Deployment must expose MCP on that host/port (Cloud Run **sidecar** on loopback) or update the URL in **`get_mcp_session()`**.
 
 Typical flows:
 
@@ -225,11 +254,12 @@ Blocking SDK work wrapped in **`asyncio.to_thread`**.
 
 ## 9. Design principles (updated)
 
-1. **Voice gateway is transport + observability** — minimal business logic; Pipecat owns dialogue mechanics.
-2. **Single pipeline definition** (`pipeline.py`) for ordering, VAD-based turns, interruptions policy, tracing flag, idle policy.
-3. **Data tier behind MCP** — Supabase and Places only on the MCP host; **`tools.py`** is the MCP client boundary (replace URL for split deploys).
+1. **Voice gateway is transport + observability + post-call handoff** — realtime dialogue stays in Pipecat; durable enrichment runs in the external LangGraph service via webhook.
+2. **Single pipeline definition** (`pipeline.py`) for ordering, VAD-based turns, interruptions policy, tracing flag, idle policy; exposes **`LLMContext`** for transcript export.
+3. **Data tier behind MCP (SSE/HTTP)** — Supabase and Places only on the MCP host; **`tools.py`** holds a **persistent SSE client**, not stdio (replace URL for split deploys).
 4. **Secrets and PII** — scrub logs and OTLP payloads where implemented; Verify before exposing reservation payloads to the LLM conversation.
 5. **Telephony defaults** — 8 kHz, phone-oriented STT model, transport VAD off, aggregator VAD on.
+6. **Post-call is best-effort** — webhook failures must not block voice shutdown or Twilio cleanup.
 
 ---
 
@@ -243,6 +273,6 @@ Blocking SDK work wrapped in **`asyncio.to_thread`**.
 | `models.py` | **`ModifyCheckoutRequest`** and other schemas (Tier-3 path uses **`SpecialistDecision`** in **`tools.py`** for structured mutation output). |
 | `judge/qa_judge.py` | Parse logs / GCP JSON → LLM-as-judge rubric. |
 | `service.yaml` | Cloud Run **Service** manifest: multi-container spec, env, **`secretKeyRef`**, dependencies, probes (keep secrets out of plain `value:` in shared repos). |
-| `README.md` | Local two-terminal workflow; **Dockerfile** for Cloud Build only; **`gcloud builds submit`** + **`gcloud run services replace`**. |
+| `README.md` | Local two-terminal workflow (+ optional LangGraph); **Dockerfile** for Cloud Build; **`POST_CALL_WEBHOOK_URL`**; MCP **SSE/HTTP** (not stdio). |
 
-This layout keeps **PSTN signaling**, **streaming media**, **dialogue inference**, **auth**, and **persistent data** in separable tiers so each can change (e.g. remote MCP URL, alternate Verify, swap STT) without rewriting the full voice stack end-to-end.
+This layout keeps **PSTN signaling**, **streaming media**, **dialogue inference**, **auth**, **persistent data (MCP)**, and **post-call automation (LangGraph)** in separable tiers so each can change (e.g. remote MCP URL, alternate Verify, swap STT, different outreach workflows) without rewriting the full voice stack end-to-end.
