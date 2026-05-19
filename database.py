@@ -8,6 +8,8 @@ asyncio event loop.
 
 import os
 import asyncio
+import random
+from datetime import datetime, timedelta
 from loguru import logger
 from supabase import create_client, Client
 from dotenv import load_dotenv
@@ -34,13 +36,58 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # ==========================================
 
 async def get_guest_with_reservations(phone_number: str) -> dict:
-    """Fetches the guest profile AND their active reservations in a SINGLE network trip."""
+    """Fetches the guest profile AND their active reservations. Auto-provisions if missing!"""
     def _query():
-        # The syntax '*, reservations(*)' forces a SQL Join under the hood!
+        # 1. Attempt standard lookup
         response = supabase.table("guests").select("*, reservations(*)").eq("phone_number", phone_number).execute()
         if response.data:
             return response.data[0]
-        return {}
+            
+        # 2. 🚀 JIT PROVISIONING LOGIC (Auto-Seeding Demo Users)
+        logger.warning(f"⚠️ Guest {phone_number} not found. Executing JIT Auto-Provisioning...")
+        
+        try:
+            # A. Create the Demo Guest Profile
+            new_guest = {
+                "phone_number": phone_number,
+                "full_name": "Avery Brooks",
+                "loyalty_tier": "Platinum",
+                "past_stays_notes": "First-time visitor. Auto-provisioned for demo."
+            }
+            guest_insert = supabase.table("guests").insert(new_guest).execute()
+            
+            if not guest_insert.data:
+                logger.error("❌ Failed to insert guest record.")
+                return {}
+                
+            guest_id = guest_insert.data[0]["id"]
+            
+            # B. Create a Dummy Reservation (Dynamically set check-in for tomorrow!)
+            tomorrow = datetime.now() + timedelta(days=1)
+            checkout = tomorrow + timedelta(days=4)
+            
+            # Generate a random 4-digit confirmation ID (e.g., "CONF-4921")
+            conf_id = f"CONF-{random.randint(1000, 9999)}"
+            
+            new_reservation = {
+                "id": conf_id,
+                "guest_id": guest_id,
+                "room_type": "Ocean View Suite",
+                "check_in_date": tomorrow.strftime("%Y-%m-%d"),
+                "check_out_date": checkout.strftime("%Y-%m-%d"),
+                "status": "Confirmed"
+            }
+            supabase.table("reservations").insert(new_reservation).execute()
+            
+            logger.info(f"✅ JIT Provisioning complete for {phone_number}. Generated {conf_id}.")
+            
+            # C. Re-run the joined query so the returned JSON perfectly matches standard schema
+            final_res = supabase.table("guests").select("*, reservations(*)").eq("phone_number", phone_number).execute()
+            return final_res.data[0] if final_res.data else {}
+            
+        except Exception as e:
+            logger.error(f"❌ JIT Provisioning failed: {e}")
+            return {}
 
     logger.info(f"[Database]: Fetching unified guest & reservation data for {phone_number}...")
     return await asyncio.to_thread(_query)

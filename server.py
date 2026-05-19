@@ -8,6 +8,7 @@ import sys
 import base64
 import logging
 import re
+from contextlib import asynccontextmanager
 import uvicorn
 import httpx
 from opentelemetry import trace
@@ -20,6 +21,7 @@ from twilio.twiml.voice_response import VoiceResponse, Connect
 from dotenv import load_dotenv
 
 # Pipecat Transports & Runners
+from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.frames.frames import EndFrame, TTSSpeakFrame
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
@@ -124,8 +126,26 @@ def configure_observability():
 
 configure_observability()
 
+# ==============================================================================
+# 🚀 ENTERPRISE MLOPS: MODEL PRE-WARMING
+# ==============================================================================
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Executes once when the Cloud Run container boots, before accepting calls."""
+    logger.info("🔥 Booting ML Models into memory (Warmup)...")
+    try:
+        # Instantiating a dummy analyzer forces the heavy ONNX C++ engine 
+        # to initialize and caches the neural network weights in system RAM.
+        _dummy_vad = SileroVADAnalyzer()
+        logger.info("✅ Silero VAD pre-loaded and ready for instant inference!")
+    except Exception as e:
+        logger.warning(f"⚠️ VAD Warmup failed: {e}")
+        
+    yield  # The server now runs and accepts phone calls!
+    
+    logger.info("Shutting down Hotel Concierge...")
 
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 
 @app.post("/inbound-call")
 async def handle_incoming_call(request: Request):
