@@ -14,11 +14,11 @@ This project is a **production-oriented telephony concierge** for a hotel use ca
 |--------|------|--------|
 | **Voice gateway** (`server.py`) | Twilio HTTP + WebSocket, Pipecat **PipelineRunner**, per-call tracing, **post-call webhook** to LangGraph service, Loguru context (`call_sid`, `ani`, `dnis`). | **`PORT`** (often **8000** locally, **8080** on Cloud Run) |
 | **Data MCP server** (`mcp_server.py`) | **Supabase** (guests/reservations + vector RAG), **Google Places**; exposes MCP tools over **SSE over HTTP** (not stdio). | **`http://127.0.0.1:8001/sse`** (same host as voice when MCP runs as a **sidecar**) |
-| **Post-call LangGraph service** (external) | Stateful **multi-agent** workflows after each call: guest profile enrichment, sentiment analysis, operational task routing, automated outreach. | **`POST_CALL_WEBHOOK_URL`** (default **`http://localhost:8002/webhook/process-call`**) |
+| **Post-call LangGraph service** ([hotel-postcall-agents](https://github.com/markesser55-spec/hotel-postcall-agents)) | Stateful **multi-agent** workflows after each call: guest profile enrichment, sentiment analysis, operational task routing, automated outreach. | **`POST_CALL_WEBHOOK_URL`** (default **`http://localhost:8002/webhook/process-call`**) |
 
 The tier-1 **`tools.py`** module is an **MCP client**: it maintains a **persistent SSE session** to the MCP server and forwards DB/RAG/maps tool calls over **HTTP**—it does **not** use MCP stdio and does **not** import `database.py` directly. **`auth.py`** wires **Twilio Verify** for SMS OTP before sensitive reservation flows (`TWILIO_VERIFY_SERVICE_SID`). Tools are created per call with **`get_hotel_concierge_tools(ani)`**.
 
-**After each call**, `server.py` builds a transcript from in-memory Pipecat **`LLMContext`** and **`POST`s** it to the LangGraph microservice (failures are logged; the voice server still shuts down cleanly).
+**After each call**, `server.py` builds a transcript from in-memory Pipecat **`LLMContext`** and **`POST`s** it to the [**hotel-postcall-agents**](https://github.com/markesser55-spec/hotel-postcall-agents) LangGraph microservice (failures are logged; the voice server still shuts down cleanly).
 
 **Reservation mutations** use a **second Gemini call** inside **`route_to_reservation_specialist`** (structured **`SpecialistDecision`** + MCP **`db_modify_reservation`**) after the guest is verified—an orchestrator / specialist pattern, not a separate long-running agent for every tool.
 
@@ -43,7 +43,7 @@ The **Dockerfile** is used by **Google Cloud Build** to produce the image refere
 | Data & RAG | **Supabase** (Postgres + `match_hotel_policies` RPC), used inside **MCP** |
 | Places | **Google Places** HTTP API (**MCP** tool) |
 | Tooling bridge | **`mcp`** (FastMCP **SSE/HTTP** server + persistent SSE client in `tools.py`) |
-| Post-call automation | **LangGraph** microservice (external); triggered via **`httpx`** webhook from `server.py` |
+| Post-call automation | [**hotel-postcall-agents**](https://github.com/markesser55-spec/hotel-postcall-agents) (**LangGraph**); triggered via **`httpx`** webhook from `server.py` |
 | Schemas | **Pydantic** |
 | Logging & traces | **Loguru**; **OpenTelemetry** → optional **Langfuse** |
 | Runtime | **Python 3.12** locally; **Dockerfile** + **Cloud Build** for deployable images |
@@ -88,7 +88,17 @@ Local testing uses **two required terminals** (no Docker). Add a **third** if yo
 
    Equivalent: `uvicorn server:app --host 0.0.0.0 --port 8000`.
 
-4. **Terminal C (optional) — LangGraph post-call microservice** — run your LangGraph app so it listens on **`POST_CALL_WEBHOOK_URL`** (default port **8002**). If it is offline, the voice server logs a warning and continues shutdown.
+4. **Terminal C (optional) — LangGraph post-call microservice** — clone and run [**hotel-postcall-agents**](https://github.com/markesser55-spec/hotel-postcall-agents) so it listens on **`POST_CALL_WEBHOOK_URL`** (default **`http://localhost:8002/webhook/process-call`**):
+
+   ```bash
+   git clone https://github.com/markesser55-spec/hotel-postcall-agents.git
+   cd hotel-postcall-agents
+   pip install -r requirements.txt
+   # configure .env (SUPABASE_*, GOOGLE_API_KEY), then:
+   uvicorn main:app --host 0.0.0.0 --port 8002
+   ```
+
+   If the post-call service is offline, the voice server logs a warning and continues shutdown.
 
 **MCP client:** **`tools.py`** opens a **persistent** SSE connection to **`http://127.0.0.1:8001/sse`** and reuses it across tool calls (reconnects if the session drops). On Cloud Run, MCP runs as a **sidecar** on the same instance so loopback still works; if MCP is remote, update the SSE URL in **`get_mcp_session()`**.
 
@@ -197,7 +207,7 @@ gcloud run services replace service.yaml --region us-west4
 - Avoid long-lived **plaintext secrets** in **`service.yaml`**; prefer **`secretKeyRef`** (and rotate anything ever committed in plain `value:` fields).
 - Point Twilio's voice URL at **`https://YOUR_SERVICE_URL/inbound-call`**. Set **`ENVIRONMENT=production`** in **`service.yaml`** (or equivalent) for JSON logs in **Cloud Logging**.
 - On the instance loopback, **`tools.py`** can keep **`http://127.0.0.1:8001/sse`** while MCP is a **sidecar**. If MCP moves to another host, change that URL in code.
-- Set **`POST_CALL_WEBHOOK_URL`** to your deployed **LangGraph** post-call service (or leave unset to use the default only in local dev).
+- Set **`POST_CALL_WEBHOOK_URL`** to your deployed [**hotel-postcall-agents**](https://github.com/markesser55-spec/hotel-postcall-agents) service URL (or leave unset to use the default only in local dev).
 
 **Forks:** substitute your **GCP project**, **region**, and **Artifact Registry** path in the **`gcloud builds submit --tag`** argument.
 
