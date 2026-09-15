@@ -6,7 +6,6 @@ Wires the AI services, tools, and turn-taking logic into a runnable task.
 from loguru import logger
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineTask, PipelineParams
-from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
@@ -17,25 +16,23 @@ from pipecat.turns.user_start import VADUserTurnStartStrategy
 from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.frames.frames import LLMMessagesAppendFrame, TTSSpeakFrame, EndFrame
-from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.observers.loggers.metrics_log_observer import MetricsLogObserver
 
-# Import our decoupled components
-import tools
-from prompts import SYSTEM_PROMPT
+from agent import ConversationAgent
 from services.stt import get_stt_service
 from services.tts import get_tts_service
-from services.llm import get_llm_service
 
 
 
 def build_pipeline(transport, call_sid: str = None, ani: str = None) -> PipelineTask:
     """Assembles the Pipecat pipeline using the provided transport."""
 
-    # 1. Fetch AI Services
+    # 1. Fetch AI Services (reasoning core owns LLM + context + tools)
     stt = get_stt_service()
     tts = get_tts_service()
-    llm = get_llm_service()
+    agent = ConversationAgent(ani=ani)
+    llm = agent.llm
+    context = agent.context
 
     # 2. Setup VAD (Voice Activity Detection) - Tuned for Noisy Environments
     vad_analyzer = SileroVADAnalyzer(
@@ -47,20 +44,7 @@ def build_pipeline(transport, call_sid: str = None, ani: str = None) -> Pipeline
         )
     )
 
-    # 3. Setup Context, Prompts, and Tools
-    dynamic_tools = tools.get_hotel_concierge_tools(ani)
-    tools_schema = ToolsSchema(standard_tools=dynamic_tools)
-
-    context = LLMContext( 
-        messages=[{"role": "system", "content": SYSTEM_PROMPT}],
-        tools=tools_schema
-    )
-
-    # Register the tools with Gemini
-    for tool_func in dynamic_tools:
-        llm.register_direct_function(tool_func)
-
-    # 4. Turn-Taking Logic
+    # 3. Turn-Taking Logic (context/tools already built inside ConversationAgent)
     context_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
@@ -106,9 +90,7 @@ def build_pipeline(transport, call_sid: str = None, ani: str = None) -> Pipeline
 
             await aggregator.push_frame(LLMMessagesAppendFrame([nudge_message], run_llm=True))
 
-            await aggregator.push_frame(LLMMessagesAppendFrame([nudge_message], run_llm=True))
-
-    # 5. Build the Pipeline (The Audio Highway)
+    # 4. Build the Pipeline (The Audio Highway)
     pipeline = Pipeline([
         transport.input(),              # Audio from Twilio
         stt,                            # Transcribe to Text

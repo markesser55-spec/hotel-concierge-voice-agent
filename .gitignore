@@ -9,7 +9,11 @@ venv/
 # (These are compiled for Mac and will confuse Linux)
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # 4. DEV TOOLS: Ignore pyenv versioning files and Mac hidden files
 .python-version
 .DS_Store
+.deepeval/
+evals/.deepeval/
+.cursor/

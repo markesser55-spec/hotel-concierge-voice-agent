@@ -1,0 +1,32 @@
+{
+  "48dc3bee-0408-5fe7-86b8-014df17cd222": {
+    "include": true,
+    "tags": ["scenario-5-parallel-tool-calling", "flagship"],
+    "notes": {}
+  },
+  "a6768e9d-2ff8-519d-b435-54af488c6a6d": {
+    "include": true,
+    "tags": ["scenario-3-reservation-lookup"],
+    "notes": {}
+  },
+  "eed12891-d91a-5c70-9e7b-73e96b4173f2": {
+    "include": true,
+    "tags": ["scenario-1-places-lookup"],
+    "notes": {}
+  },
+  "02a80c2d-a26e-59ad-a921-49ac316833ad": {
+    "include": true,
+    "tags": ["scenario-2-policy-lookup"],
+    "notes": {}
+  },
+  "cfde3405-ab16-5209-9e2c-0a5d0a28c9a9": {
+    "include": true,
+    "tags": ["scenario-2-policy-lookup"],
+    "notes": {}
+  },
+  "4c375320-63c4-534b-b492-19ca0c4565c8": {
+    "include": true,
+    "tags": ["scenario-6-escalation"],
+    "notes": {}
+  }
+}
