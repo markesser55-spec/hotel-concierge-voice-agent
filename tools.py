@@ -87,8 +87,12 @@ def get_hotel_concierge_tools(ani: str):
         if success:
             is_authenticated = True
             return await params.result_callback({
-                "status": "success", 
-                "message": "PIN verified successfully. You MUST call lookup_guest_reservation again now to fetch the data."
+                "status": "success",
+                "message": (
+                    "PIN verified successfully. You MUST call lookup_guest_reservation again now to fetch the data. "
+                    "If they want to modify, after summarizing the reservation ask for the new check-out date—"
+                    "do NOT call route_to_reservation_specialist until they provide it."
+                ),
             })
         else:
             return await params.result_callback({"status": "error", "message": "Incorrect PIN. Ask the user to try again."})
@@ -115,15 +119,33 @@ def get_hotel_concierge_tools(ani: str):
             
         guest_data = json.loads(data_str)
         if not guest_data or "error" in guest_data:
-            return await params.result_callback({"status": "error", "message": "No guest found. Ask if they have a reservation ID."})
+            return await params.result_callback({
+                "status": "error",
+                "message": "No reservation found. Ask the guest for their reservation number, then call lookup_guest_reservation with that reservation_id.",
+            })
 
-        return await params.result_callback({"status": "success", "data": guest_data})
+        return await params.result_callback({
+            "status": "success",
+            "data": guest_data,
+            "message": (
+                "Summarize the reservation for the guest (confirmation, room, check-in, check-out). "
+                "If they asked to modify dates, ask what they want the new check-out date to be—"
+                "do NOT call route_to_reservation_specialist until they provide a concrete new date. "
+                "Otherwise briefly ask if they need anything else."
+            ),
+        })
 
     async def route_to_reservation_specialist(params: FunctionCallParams, guest_request: str, reservation_id: str = ""):
         nonlocal is_authenticated
         
         if not is_authenticated:
-            return await params.result_callback({"status": "error", "message": "User is not authenticated. Call lookup_guest_reservation first."})
+            return await params.result_callback({
+                "status": "error",
+                "message": (
+                    "User is not authenticated. Call lookup_guest_reservation first to send a PIN and load the reservation. "
+                    "Do not retry this specialist tool until auth and lookup succeed and the guest has given a new check-out date."
+                ),
+            })
 
         logger.info("[Tier 3 Specialist] Waking up Gemini 2.5 Flash for secure mutation...")
         if reservation_id:
@@ -132,6 +154,12 @@ def get_hotel_concierge_tools(ani: str):
             data_str = await call_mcp_tool("db_get_guest", {"phone_number": ani})
             
         guest_data = json.loads(data_str)
+        if not guest_data or "error" in guest_data:
+            return await params.result_callback({
+                "status": "error",
+                "message": "No reservation found for this guest. Ask for a reservation number, look it up, then retry with reservation_id.",
+            })
+
         tier_3_prompt = TIER_3_SPECIALIST_PROMPT.format(guest_data=json.dumps(guest_data), guest_request=guest_request)
         
         try:
@@ -157,7 +185,22 @@ def get_hotel_concierge_tools(ani: str):
                 if not update_result or "error" in update_result:
                      return await params.result_callback({"status": "error", "message": "The backend database failed to update."})
 
-            return await params.result_callback({"status": "success", "message": f"Specialist completed the task. DO NOT read the database. Speak this exact summary: '{decision.spoken_summary}'"})
+                return await params.result_callback({
+                    "status": "success",
+                    "message": (
+                        f"Specialist completed the task. DO NOT read the database. "
+                        f"Speak this exact summary: '{decision.spoken_summary}' "
+                        f"Then briefly ask if they need anything else."
+                    ),
+                })
+
+            return await params.result_callback({
+                "status": "error",
+                "message": (
+                    f"Modification was not applied. Speak this to the guest: '{decision.spoken_summary}' "
+                    f"If a new check-out date is missing, ask for it, then call route_to_reservation_specialist again."
+                ),
+            })
 
         except Exception as e:
             logger.error(f"[Tier 3 Specialist] Error: {e}")
@@ -172,7 +215,11 @@ def get_hotel_concierge_tools(ani: str):
             return await params.result_callback({"status": "error", "message": policies["error"]})
         if not policies:
             return await params.result_callback({"status": "success", "message": "No relevant policies found. Offer to escalate."})
-        return await params.result_callback({"status": "success", "relevant_policies": policies})
+        return await params.result_callback({
+            "status": "success",
+            "relevant_policies": policies,
+            "message": "Summarize for the guest, then briefly ask if they need anything else.",
+        })
 
     async def search_nearby_places(params: FunctionCallParams, query: str):
         # DIRECT READ: Sent straight back to Tier 1 stream
@@ -183,7 +230,11 @@ def get_hotel_concierge_tools(ani: str):
             return await params.result_callback({"status": "error", "message": places["error"]})
         if not places:
             return await params.result_callback({"status": "success", "message": "No places found matching that description nearby."})
-        return await params.result_callback({"status": "success", "places": places})
+        return await params.result_callback({
+            "status": "success",
+            "places": places,
+            "message": "Summarize for the guest, then briefly ask if they need anything else.",
+        })
 
     async def escalate_to_human(params: FunctionCallParams, reason: str, urgency: str):
         logger.info(f"Escalation Triggered! Reason: {reason} | Urgency: {urgency}")

@@ -22,9 +22,11 @@ The tier-1 **`tools.py`** module is an **MCP client**: it maintains a **persiste
 
 **Reservation mutations** use a **second Gemini call** inside **`route_to_reservation_specialist`** (structured **`SpecialistDecision`** + MCP **`db_modify_reservation`**) after the guest is verified—an orchestrator / specialist pattern, not a separate long-running agent for every tool.
 
-**Observability:** Optional **Langfuse** via **OpenTelemetry** OTLP/HTTP (`setup_tracing` + **`PipelineTask(enable_tracing=True)`**). Logs and spans use **PII scrubbing** for ANI / E.164 patterns where configured in `server.py`.
+**Observability:** Optional **Langfuse** via **OpenTelemetry** OTLP/HTTP (`setup_tracing` + **`PipelineTask(enable_tracing=True)`** on the live audio pipeline). Logs and spans use **PII scrubbing** for ANI / E.164 patterns where configured in `server.py`. Tracing is wired only on the Twilio path—not on headless `run_turn()` evals.
 
-**Offline QA:** **`judge/qa_judge.py`** parses Pipecat logs or **Google Cloud Run JSON** exports and grades transcripts with Gemini (**LLM-as-judge**). Optional RTF support with `striprtf`.
+**Conversation reasoning** lives in **`agent.py`** (`ConversationAgent`): same Gemini + tools loop for live calls and text-only evals via injectable **`tool_provider`**.
+
+**Automated evals:** Golden conversations from Langfuse traces are replayed through `ConversationAgent.run_turn` with mock tools (`evals/`). DeepEval metrics score tool correctness and faithfulness. CI runs on PRs via **`.github/workflows/eval-suite.yml`**. Spec: **[`evals/EVAL_SPEC.md`](evals/EVAL_SPEC.md)**.
 
 The **Dockerfile** is used by **Google Cloud Build** to produce the image referenced by **`service.yaml`** for **Cloud Run** (voice + MCP sidecar). **Local testing does not use Docker**—run **`mcp_server.py`** and **`server.py`** in two terminals (optional third for the LangGraph post-call service). Deeper design notes live in **`ARCHITECTURE.md`**.
 
@@ -55,14 +57,17 @@ The **Dockerfile** is used by **Google Cloud Build** to produce the image refere
 | Path | Purpose |
 |------|---------|
 | `server.py` | FastAPI routes, Twilio handshake, telemetry, Pipecat run, **post-call LangGraph webhook** |
-| `pipeline.py` | STT/VAD/LLM/TTS ordering; returns **`(task, LLMContext)`** for transcript export |
+| `pipeline.py` | STT/VAD/LLM/TTS ordering; constructs **`ConversationAgent`**; returns **`(task, LLMContext)`** |
+| `agent.py` | **`ConversationAgent`**: Gemini + context + tools; headless **`run_turn`** for text evals |
 | `tools.py` | **Persistent MCP SSE/HTTP client** + per-call tools (Verify, lookups, Tier-3 specialist) |
 | `mcp_server.py` | MCP over **SSE/HTTP** on **8001** (`transport="sse"`): `db_*`, `search_*` |
 | `database.py` | Supabase access (loaded by MCP server for data tools) |
 | `auth.py` | Twilio Verify send/check PIN |
 | `services/` | Deepgram / ElevenLabs / Gemini factories |
 | `prompts.py`, `models.py` | Prompts and validation models |
-| `judge/qa_judge.py` | Automated QA from exported logs |
+| `evals/` | Mock tools, golden dataset, DeepEval metrics, extract/assemble scripts, pytest suite |
+| `requirements-eval.txt` | Eval/test stack (`deepeval`, `langfuse`, `pytest`, …) — install **with** `requirements.txt` |
+| `.github/workflows/eval-suite.yml` | PR CI: install deps, run golden conversation pytest |
 | `service.yaml` | **Cloud Run** Knative service manifest: **multi-container** (voice + MCP sidecar), env, **`secretKeyRef`**, **`container-dependencies`**, probes—**sanitize** before sharing publicly |
 
 ---
@@ -213,13 +218,19 @@ gcloud run services replace service.yaml --region us-west4
 
 ---
 
-## Automated QA (optional)
+## Automated evals (golden conversations)
+
+Text-only replay of curated Langfuse conversations through **`ConversationAgent`** + mock tools. See **[`evals/EVAL_SPEC.md`](evals/EVAL_SPEC.md)** for architecture, dataset shape, and metrics.
 
 ```bash
-python judge/qa_judge.py path/to/log_or_gcp_json_export.txt
+pip install -r requirements.txt -r requirements-eval.txt
+# GEMINI_API_KEY required (agent + DeepEval judge)
+pytest evals/tests/test_golden_conversations.py -v
 ```
 
-Install **`striprtf`** optionally for RTF log files from macOS TextEdit.
+**CI:** on every pull request, **`.github/workflows/eval-suite.yml`** runs the same pytest job (needs repo secret **`GEMINI_API_KEY`**). Concurrent pushes to the same PR cancel in-progress runs.
+
+**Dataset curation (optional):** extract traces with `evals/scripts/extract_dataset_from_langfuse.py`, decide includes in `evals/datasets/curation.json`, then `python evals/scripts/assemble_golden_dataset.py` → `evals/datasets/golden_v1.jsonl`.
 
 ---
 

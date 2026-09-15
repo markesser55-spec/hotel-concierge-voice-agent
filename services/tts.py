@@ -1,15 +1,15 @@
-"""ElevenLabs TTS factory for the voice pipeline."""
+"""Google Cloud TTS factory for the voice pipeline."""
 
 import os
-from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
+from pipecat.services.google.tts import GoogleTTSService
+from pipecat.transcriptions.language import Language
 
 
-def get_tts_service() -> ElevenLabsTTSService:
-    """Configures and returns the ElevenLabs Text-to-Speech service."""
-    return ElevenLabsTTSService(
-        api_key=os.getenv("ELEVENLABS_API_KEY"),
-        settings=ElevenLabsTTSService.Settings(
-            voice=os.getenv("ELEVENLABS_VOICE_ID"),
-            model="eleven_turbo_v2_5",  # Important for low latency on phone calls
+def get_tts_service() -> GoogleTTSService:
+    """Configures and returns the Google Cloud Text-to-Speech service."""
+    return GoogleTTSService(
+        settings=GoogleTTSService.Settings(
+            voice=os.getenv("GOOGLE_TTS_VOICE_ID"),
+            language=Language.EN_US,
         ),
     )

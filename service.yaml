@@ -34,6 +34,8 @@ spec:
               value: "ACc5dea6006945f47d713186606fb64412"
             - name: ELEVENLABS_VOICE_ID
               value: "pMsXgVXv3BLzUgSXRplE"
+            - name: GOOGLE_TTS_VOICE_ID
+              value: "en-US-Chirp3-HD-Aoede"
             - name: LANGFUSE_BASE_URL
               value: "https://us.cloud.langfuse.com"
             - name: DEEPGRAM_API_KEY

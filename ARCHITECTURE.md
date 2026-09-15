@@ -1,6 +1,6 @@
 # Architecture — Enterprise Voice Hotel Concierge
 
-This document explains how **telephony** (`server.py`), **Pipecat pipeline** (`pipeline.py`), **voice-tier tools** (`tools.py`), and the **MCP data plane** (`mcp_server.py` + `database.py`) fit together; how **Twilio WebSockets** move audio; how **VAD** and **interruptions** work; how **Twilio Verify** gates sensitive reads and mutation routing; how **OpenTelemetry / Langfuse** and **PII scrubbing** behave; and how **post-call LangGraph** workflows are triggered over HTTP after each session ends.
+This document explains how **telephony** (`server.py`), **Pipecat pipeline** (`pipeline.py`), **conversation reasoning** (`agent.py`), **voice-tier tools** (`tools.py`), and the **MCP data plane** (`mcp_server.py` + `database.py`) fit together; how **Twilio WebSockets** move audio; how **VAD** and **interruptions** work; how **Twilio Verify** gates sensitive reads and mutation routing; how **OpenTelemetry / Langfuse** and **PII scrubbing** behave; how **text-only evals** inject mock tools via `evals/`; and how **post-call LangGraph** workflows are triggered over HTTP after each session ends.
 
 ---
 
@@ -23,12 +23,17 @@ flowchart LR
   subgraph ai[AI services in pipeline]
     STT[Deepgram STT]
     VAD[Silero VAD\n+ turn strategies]
+    Agent[agent.py ConversationAgent\nLLMContext + tools]
     LLM[Gemini LLM]
     TTS[ElevenLabs TTS]
   end
 
-  subgraph tools[tools.py - MCP client]
+  subgraph tools[tools.py - MCP client\ndefault ToolProvider]
     TC[persistent SSE session\ncall_mcp_tool]
+  end
+
+  subgraph evalpkg[evals/ - mock ToolProvider\nnever imported by production]
+    ET[evals/tools.py fixtures]
   end
 
   subgraph postcall[Post-call LangGraph service\nexternal]
@@ -52,7 +57,8 @@ flowchart LR
   WS --> T --> P
   P --> STT
   P --> VAD
-  P --> LLM
+  P --> Agent
+  Agent --> LLM
   P --> TTS
   LLM -->|"function calls"| TC
   TC -->|"http://127.0.0.1:8001/sse"| MT
@@ -61,6 +67,7 @@ flowchart LR
   MT --> EMB
   LLM -->|"verify_auth_pin / PIN flow"| TV
   P -->|"after runner.run:\ntranscript + metadata"| LG
+  ET -.->|"tool_provider= injected by harness only"| Agent
 ```
 
 **Separation of concerns**
@@ -68,13 +75,15 @@ flowchart LR
 | Module | Responsibility |
 |--------|----------------|
 | `server.py` | Twilio HTTP + WebSocket I/O, TwiML, Media Streams **start** handshake, **`FastAPIWebsocketTransport`** (8 kHz, **transport VAD disabled**), **`PipelineRunner`**, root **OpenTelemetry** span per call, Langfuse exporter + **PII scrubbing**, Loguru patcher, greeting / disconnect frames, **post-call webhook** to LangGraph (`POST_CALL_WEBHOOK_URL`), **tracer `force_flush`** after the call. |
-| `pipeline.py` | Pipeline graph, **Silero VAD** in the **LLM user aggregator**, **dynamic tool list** from **`get_hotel_concierge_tools(ani)`**, **`LLMContext`**, **`enable_tracing=True`**, metrics observers, idle / **EndFrame** safeguard; returns **`(PipelineTask, LLMContext)`** so `server.py` can export the live transcript. |
-| `tools.py` | **Tier-1 Gemini tools**: Twilio Verify–gated **`lookup_guest_reservation`**, MCP-backed reads (**`db_get_*`**, **`search_hotel_policies`**, **`search_nearby_places`**), **`route_to_reservation_specialist`** (secondary Gemini JSON decision + MCP **`db_modify_reservation`**), **`escalate_to_human`**. **Persistent MCP SSE/HTTP client** (`get_mcp_session` / `call_mcp_tool`)—not stdio. |
+| `pipeline.py` | Pipeline graph, **Silero VAD** in the **LLM user aggregator**, constructs **`ConversationAgent(ani=...)`** (default real tools), wires **`agent.llm` / `agent.context`**, **`enable_tracing=True`**, metrics observers, idle / **EndFrame** safeguard; returns **`(PipelineTask, LLMContext)`** so `server.py` can export the live transcript. **Must not** import **`evals/`**. |
+| `agent.py` | **Conversation reasoning core**: **`SYSTEM_PROMPT`**, Gemini via **`get_llm_service()`**, **`LLMContext`**, tool registration. Accepts injectable **`tool_provider: Callable[[str], list]`** (default **`tools.get_hotel_concierge_tools`**). Exposes **`run_turn(user_text)`** for text-only evals (no Twilio/STT/TTS). **Must not** import **`evals/`**. |
+| `tools.py` | **Production ToolProvider** — Tier-1 Gemini tools: Twilio Verify–gated **`lookup_guest_reservation`**, MCP-backed reads (**`db_get_*`**, **`search_hotel_policies`**, **`search_nearby_places`**), **`route_to_reservation_specialist`** (secondary Gemini JSON decision + MCP **`db_modify_reservation`**), **`escalate_to_human`**. **Persistent MCP SSE/HTTP client** (`get_mcp_session` / `call_mcp_tool`)—not stdio. |
+| `evals/` | **Eval-only ToolProvider** (`evals/tools.py` + `evals/fixtures.py`): same tool names/signatures, fixture data, **starts unauthenticated** (`auth_required` until mocked `verify_auth_pin`), **no** MCP/SMS/Twilio/`auth`/`tools.py` imports. Imported only by the eval harness / pytest, never by `agent` / `pipeline` / `server`. Golden dataset + DeepEval metrics live under this package. |
 | `mcp_server.py` | **FastMCP** process: **SSE over HTTP** on **8001** (`mcp.run(transport="sse")`); owns **Supabase** and **Places** traffic; embeddings for RAG. |
 | `database.py` | Supabase client and async-safe helpers (**`asyncio.to_thread`**); imported by **MCP only** for DB/RPC paths. |
 | `auth.py` | **Twilio Verify** send/check; used from **`tools.py`** (not from MCP). |
 
-Supporting: `services/*.py`, `prompts.py`, **`judge/qa_judge.py`** (offline QA from logs).
+Supporting: `services/*.py`, `prompts.py`.
 
 ### 1.1 Local development (two required processes + optional post-call)
 
@@ -124,14 +133,16 @@ If MCP is ever moved to a **separate** Cloud Run **Service**, update the SSE URL
 - **`logger.contextualize(call_sid=..., ani=..., dnis=...)`** + **`loguru_pii_scrubber`**: redacts **ANI** and **+1XXXXXXXXXX** patterns in log messages while preserving **DNIS** where coded.
 - **`on_client_connected`**: **`TTSSpeakFrame(GREETING_PROMPT)`**.
 - **`on_client_disconnected`**: **`EndFrame()`**.
-- **`task, call_context = build_pipeline(transport, call_sid=call_sid, ani=ani)`**: **`ani`** selects the closure for **`get_hotel_concierge_tools`**; **`call_context`** is the live **`LLMContext`** used after the call for transcript export.
+- **`task, call_context = build_pipeline(transport, call_sid=call_sid, ani=ani)`**: **`ani`** is passed into **`ConversationAgent`** (default real tool provider binds Verify + MCP to that caller); **`call_context`** is the live **`LLMContext`** used after the call for transcript export.
 
 ### 2.5 Tracing (Langfuse)
 
-- **`configure_observability()`**: if **`LANGFUSE_PUBLIC_KEY`** / **`SECRET_KEY`** set, configures **`PIIScrubbingExporter`** → **`LANGFUSE_BASE_URL`/api/public/otel/v1/traces** + Basic auth; **`setup_tracing(service_name="hotel-concierge-v2", exporter=...)`**.
+- **`configure_observability()`** (in **`server.py` only**): if **`LANGFUSE_PUBLIC_KEY`** / **`SECRET_KEY`** set, configures **`PIIScrubbingExporter`** → **`LANGFUSE_BASE_URL`/api/public/otel/v1/traces** + Basic auth; **`setup_tracing(service_name="hotel-concierge-v2", exporter=...)`**.
 - **`tracer.start_as_current_span("twilio_voice_session", ...)`** with **`Context()`**, attributes **`session.id`**, **`call_sid`**, **`ani`**, **`dnis`** (span attributes scrubbed on export).
-- **`PipelineTask(enable_tracing=True)`** activates Pipecat span integration for processors.
+- **`PipelineTask(enable_tracing=True)`** in **`pipeline.py`** activates Pipecat span integration for the **live audio** pipeline.
 - After **`runner.run(task)`**, **`tracer_provider.force_flush()`** so batches reach Langfuse before the worker tears down.
+
+**Headless evals do not export traces.** `ConversationAgent.run_turn()` builds a separate `PipelineTask` without `enable_tracing`, and eval processes never import `server.py`, so OTLP/Langfuse setup never runs for golden replays.
 
 ### 2.6 Post-call LangGraph webhook
 
@@ -151,7 +162,7 @@ The **LangGraph microservice** (not in this repo) runs stateful **multi-agent** 
 
 ---
 
-## 3. `pipeline.py` — Graph, VAD, tools, tracing flags
+## 3. `pipeline.py` + `agent.py` — Graph, reasoning core, VAD, tracing flags
 
 ### 3.1 Frame order
 
@@ -159,10 +170,12 @@ The **LangGraph microservice** (not in this repo) runs stateful **multi-agent** 
 transport.input() → STT → user_aggregator → LLM → TTS → transport.output() → context_aggregator.assistant()
 ```
 
-### 3.2 Dynamic tools
+### 3.2 ConversationAgent and tool injection
 
-- **`dynamic_tools = tools.get_hotel_concierge_tools(ani)`** — one tool list **per call**, sharing **`is_authenticated`** state and binding **`ani`** for Verify + MCP arguments.
-- **`ToolsSchema`** + **`register_direct_function`** for each callable.
+- **`build_pipeline`** creates **`ConversationAgent(ani=ani)`**, which builds **`LLMContext`** (system prompt + tools) and registers tools on Gemini. Default **`tool_provider`** is **`tools.get_hotel_concierge_tools`** (real MCP + SMS).
+- **`agent.llm`** and **`agent.context`** are wired into the same frame order as before; idle / VAD stay in **`pipeline.py`**.
+- **Evals** construct **`ConversationAgent(ani=..., tool_provider=get_eval_hotel_concierge_tools)`** and call **`run_turn(user_text)`**. Production modules never import **`evals/`**; isolation is by import graph (eval tools structurally cannot reach MCP/SMS).
+- Mock **`lookup_guest_reservation`** returns **`status: "auth_required"`** until **`verify_auth_pin`** (always succeeds in evals) flips the per-session closure flag—matching **`SYSTEM_PROMPT` Rule 4** and preserving tool-call order from historical calls. See **[`evals/EVAL_SPEC.md`](evals/EVAL_SPEC.md)**.
 
 ### 3.3 Silero VAD and turn strategies
 
@@ -255,11 +268,14 @@ Blocking SDK work wrapped in **`asyncio.to_thread`**.
 ## 9. Design principles (updated)
 
 1. **Voice gateway is transport + observability + post-call handoff** — realtime dialogue stays in Pipecat; durable enrichment runs in the external LangGraph service via webhook.
-2. **Single pipeline definition** (`pipeline.py`) for ordering, VAD-based turns, interruptions policy, tracing flag, idle policy; exposes **`LLMContext`** for transcript export.
-3. **Data tier behind MCP (SSE/HTTP)** — Supabase and Places only on the MCP host; **`tools.py`** holds a **persistent SSE client**, not stdio (replace URL for split deploys).
-4. **Secrets and PII** — scrub logs and OTLP payloads where implemented; Verify before exposing reservation payloads to the LLM conversation.
-5. **Telephony defaults** — 8 kHz, phone-oriented STT model, transport VAD off, aggregator VAD on.
-6. **Post-call is best-effort** — webhook failures must not block voice shutdown or Twilio cleanup.
+2. **Reasoning is separable from telephony** — **`agent.py`** owns Gemini + context + tools; **`pipeline.py`** owns audio ordering, VAD, idle; **`server.py`** owns Twilio. Text evals call **`run_turn`** without WebSockets/STT/TTS.
+3. **Tools are injectable** — production default is MCP/SMS **`tools.py`**; evals inject **`evals/tools.py`**. Core code depends only on **`ToolProvider = Callable[[str], list]`**.
+4. **Single pipeline definition** (`pipeline.py`) for ordering, VAD-based turns, interruptions policy, tracing flag, idle policy; exposes **`LLMContext`** for transcript export.
+5. **Data tier behind MCP (SSE/HTTP)** — Supabase and Places only on the MCP host; **`tools.py`** holds a **persistent SSE client**, not stdio (replace URL for split deploys).
+6. **Secrets and PII** — scrub logs and OTLP payloads where implemented; Verify before exposing reservation payloads to the LLM conversation.
+7. **Telephony defaults** — 8 kHz, phone-oriented STT model, transport VAD off, aggregator VAD on.
+8. **Post-call is best-effort** — webhook failures must not block voice shutdown or Twilio cleanup.
+9. **Eval observability is intentionally off** — Langfuse OTel is Twilio-path only; golden replays must not spam production traces.
 
 ---
 
@@ -267,12 +283,15 @@ Blocking SDK work wrapped in **`asyncio.to_thread`**.
 
 | Path | Role |
 |------|------|
+| `agent.py` | **`ConversationAgent`**, **`TurnResult`**, injectable **`tool_provider`**, headless **`run_turn`**. |
+| `evals/` | Mock tools/fixtures, Langfuse extract/assemble, DeepEval metrics, golden pytest, **`EVAL_SPEC.md`**. |
+| `evals/datasets/golden_v1.jsonl` | Curated golden conversations (assembled from `from_langfuse.jsonl` + `curation.json`). |
+| `.github/workflows/eval-suite.yml` | PR CI for golden conversation pytest (`GEMINI_API_KEY` secret). |
 | `services/stt.py` | **`ResilientDeepgramSTTService`**, telephony Deepgram settings. |
 | `services/tts.py`, `services/llm.py` | ElevenLabs + Gemini factories. |
 | `prompts.py` | System greeting, **`TIER_3_SPECIALIST_PROMPT`**, etc. |
 | `models.py` | **`ModifyCheckoutRequest`** and other schemas (Tier-3 path uses **`SpecialistDecision`** in **`tools.py`** for structured mutation output). |
-| `judge/qa_judge.py` | Parse logs / GCP JSON → LLM-as-judge rubric. |
 | `service.yaml` | Cloud Run **Service** manifest: multi-container spec, env, **`secretKeyRef`**, dependencies, probes (keep secrets out of plain `value:` in shared repos). |
-| `README.md` | Local two-terminal workflow (+ optional LangGraph); **Dockerfile** for Cloud Build; **`POST_CALL_WEBHOOK_URL`**; MCP **SSE/HTTP** (not stdio). |
+| `README.md` | Local two-terminal workflow (+ optional LangGraph); **Dockerfile** for Cloud Build; evals + CI; MCP **SSE/HTTP** (not stdio). |
 
-This layout keeps **PSTN signaling**, **streaming media**, **dialogue inference**, **auth**, **persistent data (MCP)**, and **post-call automation (LangGraph)** in separable tiers so each can change (e.g. remote MCP URL, alternate Verify, swap STT, different outreach workflows) without rewriting the full voice stack end-to-end.
+This layout keeps **PSTN signaling**, **streaming media**, **dialogue inference**, **auth**, **persistent data (MCP)**, **text evals (mock tools)**, and **post-call automation (LangGraph)** in separable tiers so each can change (e.g. remote MCP URL, alternate Verify, swap STT, different outreach workflows) without rewriting the full voice stack end-to-end.
