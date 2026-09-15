@@ -13,7 +13,6 @@ __pycache__/
 .pytest_cache/
 
 # 4. ONE-TIME SCRIPTS: Ignore local database setup files
-# (The Cloud app talks to Supabase over the internet, it doesn't need these!)
 seed_knowledge.py
 hotel_policy.txt
 .git/
